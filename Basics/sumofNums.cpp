@@ -19,3 +19,5 @@ int main()
     cout << a << endl;
     return 0;
 }
+
+//tc O(n) and sc O(n) due to function call stack
