@@ -1,2 +1,2 @@
 # DSA-Quest
-Documenting all imp solved questions of DSA
+Solving dsa to get better so that i can leave this country
