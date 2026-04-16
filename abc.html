@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Forest Explorer</title>
+    <style>
+        * { margin: 0; padding: 0; }
+        body { overflow: hidden; }
+        #info {
+            position: absolute; top: 10px; left: 10px; color: white;
+            font-family: sans-serif; font-size: 14px; background: rgba(0,0,0,0.6);
+            padding: 15px; border-radius: 10px; z-index: 100;
+        }
+        #crosshair {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 4px; height: 4px; background: white; border-radius: 50%; z-index: 100;
+        }
+        #inventory {
+            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+            background: rgba(0,0,0,0.6); padding: 10px 20px; border-radius: 10px;
+            color: white; font-family: sans-serif; z-index: 100;
+        }
+        #start {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: white; font-family: sans-serif; font-size: 24px;
+            background: rgba(0,0,0,0.8); padding: 30px 50px; border-radius: 15px;
+            z-index: 200; cursor: pointer; text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div id="start">Click to Enter Forest<br><small>Mouse to look around</small></div>
+    <div id="info">
+        <b>Controls:</b><br>
+        WASD - Move | SHIFT - Run<br>
+        SPACE - Jump | Mouse - Look<br>
+        Left Click - Mine ground with pickaxe
+    </div>
+    <div id="crosshair"></div>
+    <div id="inventory">Dirt Blocks: <span id="dirt">0</span></div>
+
+    <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+    <script>
+        let camera, scene, renderer, isLocked = false;
+        let moveF = false, moveB = false, moveL = false, moveR = false, canJump = false, running = false;
+        let velocity = new THREE.Vector3(), dirt = 0;
+        let euler = new THREE.Euler(0, 0, 0, 'YXZ');
+        let prevTime = performance.now();
+        const SIZE = 250;
+        
+        let pickaxe, pickaxeGroup;
+        let isSwinging = false, swingProgress = 0;
+        let terrainMesh, riverMesh;
+        const dirtParticles = [];
+        let riverOffset = 0;
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87CEEB);
+            scene.fog = new THREE.FogExp2(0x88BBEE, 0.008);
+
+            camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 1000);
+            camera.position.set(0, 2, 5);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(innerWidth, innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.body.appendChild(renderer.domElement);
+
+            // Lights
+            scene.add(new THREE.AmbientLight(0x404040, 0.6));
+            const sun = new THREE.DirectionalLight(0xFFFFCC, 1.5);
+            sun.position.set(50, 100, 50);
+            sun.castShadow = true;
+            sun.shadow.mapSize.set(2048, 2048);
+            sun.shadow.camera.far = 500;
+            sun.shadow.camera.left = -150;
+            sun.shadow.camera.right = 150;
+            sun.shadow.camera.top = 150;
+            sun.shadow.camera.bottom = -150;
+            scene.add(sun);
+            scene.add(new THREE.HemisphereLight(0x87CEEB, 0x3D5C3D, 0.6));
+
+            createTerrain();
+            createMountain();
+            createRiver();
+            createTrees();
+            createRealisticGrass();
+            createFlowers();
+            createRocks();
+            createPickaxe();
+
+            // Events
+            document.getElementById('start').onclick = () => document.body.requestPointerLock();
+            document.addEventListener('pointerlockchange', () => {
+                isLocked = document.pointerLockElement === document.body;
+                document.getElementById('start').style.display = isLocked ? 'none' : 'block';
+            });
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('keydown', onKeyDown);
+            document.addEventListener('keyup', onKeyUp);
+            document.addEventListener('mousedown', onMouseDown);
+            onresize = onWindowResize;
+        }
+
+        function getTerrainHeight(x, z) {
+            let h = Math.sin(x * 0.03) * 0.8 + Math.cos(z * 0.03) * 0.8;
+            
+            // Mountain influence
+            const mx = -80, mz = -80;
+            const distToMountain = Math.sqrt((x - mx) ** 2 + (z - mz) ** 2);
+            if (distToMountain < 60) {
+                const mountainHeight = Math.max(0, (60 - distToMountain) / 60);
+                h += mountainHeight * mountainHeight * 35;
+            }
+            
+            // River carving
+            const riverZ = Math.sin(x * 0.02) * 15;
+            const distToRiver = Math.abs(z - riverZ);
+            if (distToRiver < 8) {
+                h -= (8 - distToRiver) * 0.3;
+            }
+            
+            return h;
+        }
+
+        function isInRiver(x, z) {
+            const riverZ = Math.sin(x * 0.02) * 15;
+            return Math.abs(z - riverZ) < 6;
+        }
+
+        function createTerrain() {
+            const terrainGeo = new THREE.PlaneGeometry(SIZE * 2, SIZE * 2, 200, 200);
+            terrainGeo.rotateX(-Math.PI / 2);
+            const v = terrainGeo.attributes.position.array;
+            
+            for (let i = 0; i < v.length; i += 3) {
+                v[i + 1] = getTerrainHeight(v[i], v[i + 2]);
+            }
+            terrainGeo.computeVertexNormals();
+            
+            // Multi-colored terrain
+            const colors = [];
+            for (let i = 0; i < v.length; i += 3) {
+                const height = v[i + 1];
+                let r, g, b;
+                
+                if (height > 20) {
+                    // Snow cap
+                    r = 0.95; g = 0.95; b = 0.95;
+                } else if (height > 12) {
+                    // Rocky
+                    r = 0.4 + Math.random() * 0.1;
+                    g = 0.35 + Math.random() * 0.1;
+                    b = 0.3 + Math.random() * 0.1;
+                } else if (height > 5) {
+                    // Mountain grass
+                    r = 0.2 + Math.random() * 0.1;
+                    g = 0.35 + Math.random() * 0.1;
+                    b = 0.15;
+                } else {
+                    // Normal grass
+                    r = 0.15 + Math.random() * 0.1;
+                    g = 0.25 + Math.random() * 0.15;
+                    b = 0.1;
+                }
+                colors.push(r, g, b);
+            }
+            terrainGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            
+            terrainMesh = new THREE.Mesh(terrainGeo, new THREE.MeshLambertMaterial({ 
+                vertexColors: true
+            }));
+            terrainMesh.receiveShadow = true;
+            terrainMesh.name = 'terrain';
+            scene.add(terrainMesh);
+        }
+
+        function createMountain() {
+            // Add extra mountain details - rocky outcrops
+            const mx = -80, mz = -80;
+            
+            for (let i = 0; i < 40; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                const dist = 10 + Math.random() * 35;
+                const x = mx + Math.cos(angle) * dist;
+                const z = mz + Math.sin(angle) * dist;
+                const y = getTerrainHeight(x, z);
+                
+                const rock = new THREE.Mesh(
+                    new THREE.DodecahedronGeometry(1 + Math.random() * 3, 1),
+                    new THREE.MeshLambertMaterial({ 
+                        color: new THREE.Color().setHSL(0, 0, 0.35 + Math.random() * 0.15) 
+                    })
+                );
+                rock.position.set(x, y + 0.5, z);
+                rock.rotation.set(Math.random(), Math.random(), Math.random());
+                rock.scale.y = 0.5 + Math.random() * 0.5;
+                rock.castShadow = true;
+                scene.add(rock);
+            }
+            
+            // Snow patches on top
+            for (let i = 0; i < 15; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                const dist = Math.random() * 15;
+                const x = mx + Math.cos(angle) * dist;
+                const z = mz + Math.sin(angle) * dist;
+                const y = getTerrainHeight(x, z);
+                
+                if (y > 18) {
+                    const snow = new THREE.Mesh(
+                        new THREE.SphereGeometry(2 + Math.random() * 3, 8, 6),
+                        new THREE.MeshLambertMaterial({ color: 0xFFFFFF })
+                    );
+                    snow.position.set(x, y + 0.3, z);
+                    snow.scale.y = 0.3;
+                    scene.add(snow);
+                }
+            }
+        }
+
+        function createRiver() {
+            // Create river path
+            const riverPoints = [];
+            for (let x = -SIZE; x <= SIZE; x += 2) {
+                const z = Math.sin(x * 0.02) * 15;
+                const y = getTerrainHeight(x, z) + 0.1;
+                riverPoints.push(new THREE.Vector3(x, Math.min(y, -0.5), z));
+            }
+            
+            // River bed
+            const riverBedGeo = new THREE.PlaneGeometry(SIZE * 2, 10, 100, 5);
+            riverBedGeo.rotateX(-Math.PI / 2);
+            const bedV = riverBedGeo.attributes.position.array;
+            for (let i = 0; i < bedV.length; i += 3) {
+                const x = bedV[i];
+                const localZ = bedV[i + 2];
+                bedV[i + 2] = Math.sin(x * 0.02) * 15 + localZ;
+                bedV[i + 1] = -1.5 + Math.abs(localZ) * 0.1;
+            }
+            riverBedGeo.computeVertexNormals();
+            
+            const riverBed = new THREE.Mesh(riverBedGeo, new THREE.MeshLambertMaterial({ 
+                color: 0x3D2817 
+            }));
+            scene.add(riverBed);
+            
+            // Water surface
+            const waterGeo = new THREE.PlaneGeometry(SIZE * 2, 8, 150, 8);
+            waterGeo.rotateX(-Math.PI / 2);
+            const wv = waterGeo.attributes.position.array;
+            for (let i = 0; i < wv.length; i += 3) {
+                const x = wv[i];
+                const localZ = wv[i + 2];
+                wv[i + 2] = Math.sin(x * 0.02) * 15 + localZ;
+                wv[i + 1] = -0.3;
+            }
+            waterGeo.computeVertexNormals();
+            
+            riverMesh = new THREE.Mesh(waterGeo, new THREE.MeshPhongMaterial({ 
+                color: 0x1E90FF,
+                transparent: true,
+                opacity: 0.7,
+                shininess: 100,
+                specular: 0x444444
+            }));
+            scene.add(riverMesh);
+            
+            // River banks with rocks
+            for (let x = -SIZE; x < SIZE; x += 8) {
+                for (let side = -1; side <= 1; side += 2) {
+                    const z = Math.sin(x * 0.02) * 15 + side * (5 + Math.random() * 2);
+                    const y = getTerrainHeight(x, z);
+                    
+                    if (Math.random() > 0.5) {
+                        const rock = new THREE.Mesh(
+                            new THREE.DodecahedronGeometry(0.3 + Math.random() * 0.5, 0),
+                            new THREE.MeshLambertMaterial({ color: 0x555555 })
+                        );
+                        rock.position.set(x + Math.random() * 2, y + 0.1, z);
+                        rock.rotation.set(Math.random(), Math.random(), Math.random());
+                        scene.add(rock);
+                    }
+                }
+            }
+            
+            // Lily pads
+            for (let i = 0; i < 30; i++) {
+                const x = (Math.random() - 0.5) * SIZE * 1.5;
+                const z = Math.sin(x * 0.02) * 15 + (Math.random() - 0.5) * 5;
+                
+                const lily = new THREE.Mesh(
+                    new THREE.CircleGeometry(0.3 + Math.random() * 0.3, 8),
+                    new THREE.MeshLambertMaterial({ color: 0x228B22, side: THREE.DoubleSide })
+                );
+                lily.rotation.x = -Math.PI / 2;
+                lily.position.set(x, -0.25, z);
+                scene.add(lily);
+                
+                // Flower on some
+                if (Math.random() > 0.6) {
+                    const flower = new THREE.Mesh(
+                        new THREE.SphereGeometry(0.1, 6, 6),
+                        new THREE.MeshLambertMaterial({ color: 0xFFB6C1 })
+                    );
+                    flower.position.set(x, -0.15, z);
+                    scene.add(flower);
+                }
+            }
+        }
+
+        function createPickaxe() {
+            pickaxeGroup = new THREE.Group();
+            
+            // Handle
+            const handleGeo = new THREE.BoxGeometry(0.05, 0.4, 0.05);
+            const handleMat = new THREE.MeshLambertMaterial({ color: 0x8B4513 });
+            const handle = new THREE.Mesh(handleGeo, handleMat);
+            handle.position.y = -0.2;
+            pickaxeGroup.add(handle);
+            
+            // Pickaxe head
+            const headGeo = new THREE.BoxGeometry(0.25, 0.08, 0.05);
+            const headMat = new THREE.MeshLambertMaterial({ color: 0x666666 });
+            const head = new THREE.Mesh(headGeo, headMat);
+            head.position.y = 0.02;
+            pickaxeGroup.add(head);
+            
+            // Pick points
+            const pointGeo = new THREE.BoxGeometry(0.15, 0.06, 0.04);
+            const point = new THREE.Mesh(pointGeo, headMat);
+            point.position.set(-0.18, 0.02, 0);
+            point.rotation.z = -0.3;
+            pickaxeGroup.add(point);
+            
+            const tipGeo = new THREE.BoxGeometry(0.08, 0.04, 0.03);
+            const tip = new THREE.Mesh(tipGeo, headMat);
+            tip.position.set(-0.28, -0.02, 0);
+            tip.rotation.z = -0.5;
+            pickaxeGroup.add(tip);
+            
+            const flatGeo = new THREE.BoxGeometry(0.1, 0.1, 0.04);
+            const flat = new THREE.Mesh(flatGeo, headMat);
+            flat.position.set(0.15, 0, 0);
+            pickaxeGroup.add(flat);
+            
+            pickaxeGroup.position.set(0.35, -0.3, -0.5);
+            pickaxeGroup.rotation.z = 0.3;
+            camera.add(pickaxeGroup);
+            scene.add(camera);
+        }
+
+        function createRealisticGrass() {
+            const grassBladeGeo = new THREE.BufferGeometry();
+            const bladeWidth = 0.04;
+            const bladeHeight = 0.4;
+            
+            const vertices = new Float32Array([
+                -bladeWidth/2, 0, 0,
+                bladeWidth/2, 0, 0,
+                -bladeWidth/3, bladeHeight * 0.33, 0.02,
+                bladeWidth/3, bladeHeight * 0.33, 0.02,
+                -bladeWidth/4, bladeHeight * 0.66, 0.05,
+                bladeWidth/4, bladeHeight * 0.66, 0.05,
+                0, bladeHeight, 0.08
+            ]);
+            
+            const indices = [0, 1, 2, 2, 1, 3, 2, 3, 4, 4, 3, 5, 4, 5, 6];
+            grassBladeGeo.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+            grassBladeGeo.setIndex(indices);
+            grassBladeGeo.computeVertexNormals();
+            
+            const grassCount = 80000;
+            const dummy = new THREE.Object3D();
+            const grassMat = new THREE.MeshLambertMaterial({ color: 0x3d8c40, side: THREE.DoubleSide });
+            const instancedGrass = new THREE.InstancedMesh(grassBladeGeo, grassMat, grassCount);
+            const colorArray = new Float32Array(grassCount * 3);
+            
+            let idx = 0;
+            for (let i = 0; i < grassCount; i++) {
+                const x = (Math.random() - 0.5) * SIZE * 1.9;
+                const z = (Math.random() - 0.5) * SIZE * 1.9;
+                
+                // Skip river area
+                if (isInRiver(x, z)) continue;
+                
+                const y = getTerrainHeight(x, z);
+                
+                // Less grass on mountain tops
+                if (y > 15 && Math.random() > 0.3) continue;
+                
+                dummy.position.set(x, y, z);
+                dummy.rotation.y = Math.random() * Math.PI * 2;
+                dummy.scale.setScalar(0.8 + Math.random() * 0.6);
+                dummy.updateMatrix();
+                instancedGrass.setMatrixAt(idx, dummy.matrix);
+                
+                const hue = 0.25 + Math.random() * 0.1;
+                const sat = 0.5 + Math.random() * 0.3;
+                const light = 0.25 + Math.random() * 0.2;
+                const color = new THREE.Color().setHSL(hue, sat, light);
+                colorArray[idx * 3] = color.r;
+                colorArray[idx * 3 + 1] = color.g;
+                colorArray[idx * 3 + 2] = color.b;
+                idx++;
+            }
+            
+            instancedGrass.count = idx;
+            instancedGrass.instanceMatrix.needsUpdate = true;
+            instancedGrass.geometry.setAttribute('color', new THREE.InstancedBufferAttribute(colorArray, 3));
+            instancedGrass.material.vertexColors = true;
+            scene.add(instancedGrass);
+            
+            // Grass clumps
+            for (let i = 0; i < 3000; i++) {
+                const x = (Math.random() - 0.5) * SIZE * 1.8;
+                const z = (Math.random() - 0.5) * SIZE * 1.8;
+                if (isInRiver(x, z)) continue;
+                
+                const y = getTerrainHeight(x, z);
+                if (y > 18) continue;
+                
+                const clump = new THREE.Group();
+                for (let j = 0; j < 5; j++) {
+                    const blade = new THREE.Mesh(
+                        new THREE.PlaneGeometry(0.05, 0.3 + Math.random() * 0.3),
+                        new THREE.MeshLambertMaterial({
+                            color: new THREE.Color().setHSL(0.25 + Math.random() * 0.1, 0.6, 0.3),
+                            side: THREE.DoubleSide
+                        })
+                    );
+                    blade.position.set((Math.random() - 0.5) * 0.2, 0.15, (Math.random() - 0.5) * 0.2);
+                    blade.rotation.y = Math.random() * Math.PI;
+                    clump.add(blade);
+                }
+                clump.position.set(x, y, z);
+                scene.add(clump);
+            }
+        }
+
+        function createTrees() {
+            // Many more trees - 300
+            for (let i = 0; i < 300; i++) {
+                const x = (Math.random() - 0.5) * SIZE * 1.9;
+                const z = (Math.random() - 0.5) * SIZE * 1.9;
+                
+                // Skip spawn area, river, and high mountain
+                if (Math.abs(x) < 5 && Math.abs(z) < 5) continue;
+                if (isInRiver(x, z)) continue;
+                
+                const y = getTerrainHeight(x, z);
+                if (y > 20) continue; // No trees on snow
+                
+                const tree = new THREE.Group();
+                const h = 4 + Math.random() * 8;
+                
+                // Trunk
+                const trunk = new THREE.Mesh(
+                    new THREE.CylinderGeometry(0.12, 0.25, h, 8),
+                    new THREE.MeshLambertMaterial({ color: 0x4A3728 })
+                );
+                trunk.position.y = h / 2;
+                trunk.castShadow = true;
+                tree.add(trunk);
+                
+                // Varied tree types
+                const treeType = Math.random();
+                
+                if (treeType < 0.6) {
+                    // Conifer
+                    const foliageColors = [0x228B22, 0x2E8B2E, 0x1E6B1E, 0x3CB371];
+                    for (let j = 0; j < 4; j++) {
+                        const foliage = new THREE.Mesh(
+                            new THREE.ConeGeometry(2.2 - j * 0.4, 2.5, 8),
+                            new THREE.MeshLambertMaterial({ 
+                                color: foliageColors[Math.floor(Math.random() * foliageColors.length)] 
+                            })
+                        );
+                        foliage.position.y = h * 0.45 + j * 1.2;
+                        foliage.castShadow = true;
+                        tree.add(foliage);
+                    }
+                } else if (treeType < 0.85) {
+                    // Round tree
+                    const foliage = new THREE.Mesh(
+                        new THREE.SphereGeometry(2 + Math.random(), 8, 8),
+                        new THREE.MeshLambertMaterial({ color: 0x2E8B2E })
+                    );
+                    foliage.position.y = h + 1;
+                    foliage.scale.y = 0.8;
+                    foliage.castShadow = true;
+                    tree.add(foliage);
+                } else {
+                    // Birch-like
+                    trunk.material = new THREE.MeshLambertMaterial({ color: 0xE8E8E8 });
+                    const foliage = new THREE.Mesh(
+                        new THREE.SphereGeometry(1.5 + Math.random(), 8, 8),
+                        new THREE.MeshLambertMaterial({ color: 0x90EE90 })
+                    );
+                    foliage.position.y = h + 0.5;
+                    foliage.scale.set(1, 1.2, 1);
+                    foliage.castShadow = true;
+                    tree.add(foliage);
+                }
+                
+                tree.position.set(x, y, z);
+                scene.add(tree);
+            }
+        }
+
+        function createFlowers() {
+            const flowerColors = [0xFF69B4, 0xFFD700, 0xFF6347, 0xDA70D6, 0xFFFFFF, 0xFF4500];
+            for (let i = 0; i < 400; i++) {
+                const x = (Math.random() - 0.5) * SIZE * 1.5;
+                const z = (Math.random() - 0.5) * SIZE * 1.5;
+                if (isInRiver(x, z)) continue;
+                
+                const y = getTerrainHeight(x, z);
+                if (y > 12) continue;
+                
+                const flower = new THREE.Group();
+                
+                const stem = new THREE.Mesh(
+                    new THREE.CylinderGeometry(0.01, 0.015, 0.25, 4),
+                    new THREE.MeshLambertMaterial({ color: 0x228B22 })
+                );
+                stem.position.y = 0.125;
+                flower.add(stem);
+                
+                const petalColor = flowerColors[Math.floor(Math.random() * flowerColors.length)];
+                for (let p = 0; p < 5; p++) {
+                    const petal = new THREE.Mesh(
+                        new THREE.SphereGeometry(0.04, 6, 6),
+                        new THREE.MeshLambertMaterial({ color: petalColor })
+                    );
+                    const angle = (p / 5) * Math.PI * 2;
+                    petal.position.set(Math.cos(angle) * 0.05, 0.28, Math.sin(angle) * 0.05);
+                    petal.scale.set(1, 0.5, 1);
+                    flower.add(petal);
+                }
+                
+                const center = new THREE.Mesh(
+                    new THREE.SphereGeometry(0.03, 6, 6),
+                    new THREE.MeshLambertMaterial({ color: 0xFFFF00 })
+                );
+                center.position.y = 0.28;
+                flower.add(center);
+                
+                flower.position.set(x, y, z);
+                scene.add(flower);
+            }
+        }
+
+        function createRocks() {
+            // Many more rocks - 200
+            for (let i = 0; i < 200; i++) {
+                const x = (Math.random() - 0.5) * SIZE * 1.8;
+                const z = (Math.random() - 0.5) * SIZE * 1.8;
+                if (isInRiver(x, z) && Math.random() > 0.2) continue;
+                
+                const y = getTerrainHeight(x, z);
+                
+                const size = 0.2 + Math.random() * 0.6;
+                const rock = new THREE.Mesh(
+                    new THREE.DodecahedronGeometry(size, Math.random() > 0.5 ? 0 : 1),
+                    new THREE.MeshLambertMaterial({ 
+                        color: new THREE.Color().setHSL(0, 0, 0.3 + Math.random() * 0.25) 
+                    })
+                );
+                rock.position.set(x, y + size * 0.4, z);
+                rock.rotation.set(Math.random(), Math.random(), Math.random());
+                rock.scale.y = 0.5 + Math.random() * 0.5;
+                rock.castShadow = true;
+                scene.add(rock);
+            }
+            
+            // Boulder clusters
+            for (let i = 0; i < 20; i++) {
+                const cx = (Math.random() - 0.5) * SIZE * 1.5;
+                const cz = (Math.random() - 0.5) * SIZE * 1.5;
+                if (isInRiver(cx, cz)) continue;
+                
+                const cy = getTerrainHeight(cx, cz);
+                
+                for (let j = 0; j < 5; j++) {
+                    const size = 0.4 + Math.random() * 0.8;
+                    const rock = new THREE.Mesh(
+                        new THREE.DodecahedronGeometry(size, 1),
+                        new THREE.MeshLambertMaterial({ color: 0x555555 })
+                    );
+                    rock.position.set(
+                        cx + (Math.random() - 0.5) * 3,
+                        cy + size * 0.3,
+                        cz + (Math.random() - 0.5) * 3
+                    );
+                    rock.rotation.set(Math.random(), Math.random(), Math.random());
+                    rock.castShadow = true;
+                    scene.add(rock);
+                }
+            }
+        }
+
+        function mineGround() {
+            swingPickaxe();
+            
+            setTimeout(() => {
+                const ray = new THREE.Raycaster();
+                ray.setFromCamera(new THREE.Vector2(0, 0), camera);
+                const hits = ray.intersectObject(terrainMesh);
+                
+                if (hits.length && hits[0].distance < 4) {
+                    const p = hits[0].point.clone();
+                    
+                    // Create hole
+                    const holeGeo = new THREE.CylinderGeometry(0.6, 0.4, 0.5, 8);
+                    const holeMat = new THREE.MeshLambertMaterial({ color: 0x3D2817 });
+                    const hole = new THREE.Mesh(holeGeo, holeMat);
+                    hole.position.set(p.x, p.y - 0.25, p.z);
+                    scene.add(hole);
+                    
+                    const innerHole = new THREE.Mesh(
+                        new THREE.CylinderGeometry(0.35, 0.25, 0.4, 8),
+                        new THREE.MeshLambertMaterial({ color: 0x1a0f0a })
+                    );
+                    innerHole.position.set(p.x, p.y - 0.35, p.z);
+                    scene.add(innerHole);
+                    
+                    const ringGeo = new THREE.TorusGeometry(0.5, 0.15, 6, 12);
+                    const ring = new THREE.Mesh(ringGeo, new THREE.MeshLambertMaterial({ color: 0x5C4033 }));
+                    ring.rotation.x = -Math.PI / 2;
+                    ring.position.set(p.x, p.y + 0.05, p.z);
+                    scene.add(ring);
+                    
+                    // Dirt chunks
+                    for (let i = 0; i < 12; i++) {
+                        const chunkSize = 0.08 + Math.random() * 0.1;
+                        const chunk = new THREE.Mesh(
+                            new THREE.BoxGeometry(chunkSize, chunkSize, chunkSize),
+                            new THREE.MeshLambertMaterial({ 
+                                color: new THREE.Color().setHSL(0.07, 0.6, 0.2 + Math.random() * 0.15) 
+                            })
+                        );
+                        chunk.position.copy(p);
+                        chunk.position.y += 0.2;
+                        chunk.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+                        
+                        const angle = Math.random() * Math.PI * 2;
+                        const speed = 0.05 + Math.random() * 0.08;
+                        chunk.userData = {
+                            vx: Math.cos(angle) * speed,
+                            vy: 0.12 + Math.random() * 0.1,
+                            vz: Math.sin(angle) * speed,
+                            rotSpeed: (Math.random() - 0.5) * 0.3,
+                            life: 80 + Math.random() * 40,
+                            groundY: p.y
+                        };
+                        scene.add(chunk);
+                        dirtParticles.push(chunk);
+                    }
+                    
+                    // Small particles
+                    for (let i = 0; i < 20; i++) {
+                        const particle = new THREE.Mesh(
+                            new THREE.SphereGeometry(0.02 + Math.random() * 0.03, 4, 4),
+                            new THREE.MeshLambertMaterial({ color: 0x5C4033 })
+                        );
+                        particle.position.copy(p);
+                        
+                        const angle = Math.random() * Math.PI * 2;
+                        const speed = 0.03 + Math.random() * 0.06;
+                        particle.userData = {
+                            vx: Math.cos(angle) * speed,
+                            vy: 0.08 + Math.random() * 0.08,
+                            vz: Math.sin(angle) * speed,
+                            rotSpeed: 0,
+                            life: 50 + Math.random() * 30,
+                            groundY: p.y
+                        };
+                        scene.add(particle);
+                        dirtParticles.push(particle);
+                    }
+                    
+                    dirt++;
+                    document.getElementById('dirt').textContent = dirt;
+                }
+            }, 150);
+        }
+
+        function swingPickaxe() {
+            if (isSwinging) return;
+            isSwinging = true;
+            swingProgress = 0;
+        }
+
+        function onMouseMove(e) {
+            if (!isLocked) return;
+            euler.setFromQuaternion(camera.quaternion);
+            euler.y -= e.movementX * 0.002;
+            euler.x -= e.movementY * 0.002;
+            euler.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, euler.x));
+            camera.quaternion.setFromEuler(euler);
+        }
+
+        function onKeyDown(e) {
+            if (e.code === 'KeyW') moveF = true;
+            if (e.code === 'KeyS') moveB = true;
+            if (e.code === 'KeyA') moveL = true;
+            if (e.code === 'KeyD') moveR = true;
+            if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') running = true;
+            if (e.code === 'Space' && canJump) { velocity.y = 10; canJump = false; }
+        }
+
+        function onKeyUp(e) {
+            if (e.code === 'KeyW') moveF = false;
+            if (e.code === 'KeyS') moveB = false;
+            if (e.code === 'KeyA') moveL = false;
+            if (e.code === 'KeyD') moveR = false;
+            if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') running = false;
+        }
+
+        function onMouseDown(e) {
+            if (isLocked && e.button === 0) mineGround();
+        }
+
+        function onWindowResize() {
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(innerWidth, innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const now = performance.now(), dt = (now - prevTime) / 1000;
+            prevTime = now;
+
+            // Animate river flow
+            riverOffset += dt * 0.5;
+            if (riverMesh) {
+                const wv = riverMesh.geometry.attributes.position.array;
+                for (let i = 0; i < wv.length; i += 3) {
+                    const x = wv[i];
+                    wv[i + 1] = -0.3 + Math.sin(x * 0.1 + riverOffset * 3) * 0.05 + 
+                                Math.sin(x * 0.3 + riverOffset * 5) * 0.02;
+                }
+                riverMesh.geometry.attributes.position.needsUpdate = true;
+            }
+
+            // Pickaxe swing
+            if (isSwinging) {
+                swingProgress += 0.15;
+                if (swingProgress < 1) {
+                    pickaxeGroup.rotation.x = -swingProgress * 1.2;
+                    pickaxeGroup.position.y = -0.3 - swingProgress * 0.15;
+                } else if (swingProgress < 2) {
+                    const ret = swingProgress - 1;
+                    pickaxeGroup.rotation.x = -1.2 + ret * 1.2;
+                    pickaxeGroup.position.y = -0.45 + ret * 0.15;
+                } else {
+                    isSwinging = false;
+                    pickaxeGroup.rotation.x = 0;
+                    pickaxeGroup.position.y = -0.3;
+                }
+            }
+
+            // Update dirt particles
+            for (let i = dirtParticles.length - 1; i >= 0; i--) {
+                const p = dirtParticles[i];
+                const d = p.userData;
+                
+                p.position.x += d.vx;
+                p.position.y += d.vy;
+                p.position.z += d.vz;
+                d.vy -= 0.008;
+                
+                if (p.position.y < d.groundY + 0.05) {
+                    p.position.y = d.groundY + 0.05;
+                    d.vy *= -0.3;
+                    d.vx *= 0.7;
+                    d.vz *= 0.7;
+                }
+                
+                p.rotation.x += d.rotSpeed;
+                p.rotation.z += d.rotSpeed * 0.7;
+                
+                d.life--;
+                if (d.life < 20) p.scale.multiplyScalar(0.92);
+                
+                if (d.life <= 0) {
+                    scene.remove(p);
+                    dirtParticles.splice(i, 1);
+                }
+            }
+
+            // Movement
+            if (isLocked) {
+                velocity.y -= 25 * dt;
+                const speed = running ? 18 : 10;
+                const dir = new THREE.Vector3();
+                dir.z = Number(moveF) - Number(moveB);
+                dir.x = Number(moveR) - Number(moveL);
+                dir.normalize();
+
+                const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+                fwd.y = 0; fwd.normalize();
+                const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+                right.y = 0; right.normalize();
+
+                camera.position.addScaledVector(fwd, dir.z * speed * dt);
+                camera.position.addScaledVector(right, dir.x * speed * dt);
+                camera.position.y += velocity.y * dt;
+
+                // Terrain following
+                const groundY = getTerrainHeight(camera.position.x, camera.position.z) + 2;
+                
+                // Water collision - slow down in river
+                if (isInRiver(camera.position.x, camera.position.z)) {
+                    if (camera.position.y < 1.5) {
+                        camera.position.y = 1.5;
+                        velocity.y = 0;
+                        canJump = true;
+                    }
+                } else if (camera.position.y < groundY) {
+                    velocity.y = 0;
+                    camera.position.y = groundY;
+                    canJump = true;
+                }
+                
+                camera.position.x = Math.max(-SIZE, Math.min(SIZE, camera.position.x));
+                camera.position.z = Math.max(-SIZE, Math.min(SIZE, camera.position.z));
+            }
+            
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
